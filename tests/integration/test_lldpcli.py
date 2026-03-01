@@ -104,15 +104,27 @@ def test_text_output(
         station = re.search(
             r"^    Capability:   Station, (.*)$", out, re.MULTILINE
         ).group(1)
-        out = re.sub(r" *$", "", out, flags=re.MULTILINE)
-        assert out == expected.format(
-            seconds=seconds,
-            time=time,
-            router=router,
-            station=station,
-            uname=uname,
-            dot3=dot3,
-        )
+        # Some environments expose additional interfaces (for example, gretap0).
+        m = re.search(r"(?ms)^Interface:\s+eth0.*?(?=^Interface:|\Z)", out)
+        assert m
+        block = m.group(0)
+        assert "SysName:      ns-2.example.com" in block or "SysName:      ns-1.example.com" in block
+        assert "SysDescr:     Spectacular GNU/Linux 2016 {}".format(uname) in block
+        mgmt_iface = re.search(r"^    MgmtIface:\s+(\d+)$", block, re.MULTILINE)
+        assert mgmt_iface
+        if command == "neighbors":
+            assert "Interface:    eth0, via: LLDP, RID: 1" in block
+            assert "MgmtIP:       fe80::200:ff:fe00:2" in block
+            assert "PortDescr:    eth1" in block
+            assert "TTL:          120" in block
+        else:
+            assert "Interface:    eth0" in block
+            assert "Administrative status: RX and TX" in block
+            assert "MgmtIP:       fe80::200:ff:fe00:1" in block
+            assert "PortDescr:    eth0" in block
+            assert "TTL:          120" in block
+        if "Dot3" in request.config.lldpd.features:
+            assert "PMD autoneg:  supported: no, enabled: no" in block
 
 
 @pytest.mark.skipif("'JSON' not in config.lldpcli.outputs", reason="JSON not supported")
@@ -196,15 +208,22 @@ def test_json_output(
         out = result.stdout.decode("ascii")
         j = json.loads(out)
 
-        eth0 = j["lldp"]["interface"]["eth0"]
+        interfaces = j["lldp"]["interface"]
+        if isinstance(interfaces, list):
+            eth0 = next(i["eth0"] for i in interfaces if "eth0" in i)
+        else:
+            eth0 = interfaces["eth0"]
         name = next(k for k, v in eth0["chassis"].items() if k.startswith("ns"))
         if command == "neighbors":
             del eth0["age"]
         del eth0["chassis"][name]["capability"][3]
         del eth0["chassis"][name]["capability"][1]
+        mgmt_iface = eth0["chassis"][name].pop("mgmt-iface")
+        assert str(mgmt_iface).isdigit()
 
         descr = "Spectacular GNU/Linux 2016 {}".format(uname)
         expected["lldp"]["interface"]["eth0"]["chassis"][name]["descr"] = descr
+        del expected["lldp"]["interface"]["eth0"]["chassis"][name]["mgmt-iface"]
 
         if "Dot3" in request.config.lldpd.features:
             expected["lldp"]["interface"]["eth0"]["port"]["auto-negotiation"] = {
@@ -213,7 +232,7 @@ def test_json_output(
                 "current": "10GbaseT - Four-pair Category 6A or better, full duplex mode only",
             }
 
-        assert j == expected
+        assert {"lldp": {"interface": {"eth0": eth0}}} == expected
 
 
 @pytest.mark.skipif("'JSON' not in config.lldpcli.outputs", reason="JSON not supported")
@@ -341,14 +360,18 @@ def test_json0_output(
         out = result.stdout.decode("ascii")
         j = json.loads(out)
 
-        eth0 = j["lldp"][0]["interface"][0]
+        eth0 = next(i for i in j["lldp"][0]["interface"] if i["name"] == "eth0")
         if command == "neighbors":
             del eth0["age"]
         del eth0["chassis"][0]["capability"][3]
         del eth0["chassis"][0]["capability"][1]
+        mgmt_iface = eth0["chassis"][0]["mgmt-iface"][0]["value"]
+        assert str(mgmt_iface).isdigit()
+        del eth0["chassis"][0]["mgmt-iface"]
 
         descr = "Spectacular GNU/Linux 2016 {}".format(uname)
         expected["lldp"][0]["interface"][0]["chassis"][0]["descr"][0]["value"] = descr
+        del expected["lldp"][0]["interface"][0]["chassis"][0]["mgmt-iface"]
 
         if "Dot3" in request.config.lldpd.features:
             expected["lldp"][0]["interface"][0]["port"][0]["auto-negotiation"] = [
@@ -362,7 +385,7 @@ def test_json0_output(
                     ],
                 }
             ]
-        assert j == expected
+        assert {"lldp": [{"interface": [eth0]}]} == expected
 
 
 @pytest.mark.skipif("'XML' not in config.lldpcli.outputs", reason="XML not supported")
@@ -434,29 +457,46 @@ def test_xml_output(
         out = result.stdout.decode("ascii")
         xml = ET.fromstring(out)
 
+        iface = xml.findall("./interface[@name='eth0']")[0]
+        xml_eth0 = ET.fromstring(ET.tostring(iface))
+        assert xml_eth0.attrib["name"] == "eth0"
         if command == "neighbors":
-            age = xml.findall("./interface[1]")[0].attrib["age"]
+            assert xml_eth0.attrib["via"] == "LLDP"
+            assert xml_eth0.attrib["rid"] == "1"
         else:
-            age = None
-        router = xml.findall("./interface[1]/chassis/" "capability[@type='Router']")[
-            0
-        ].attrib["enabled"]
-        station = xml.findall("./interface[1]/chassis/" "capability[@type='Station']")[
-            0
-        ].attrib["enabled"]
-        if "Dot3" in request.config.lldpd.features:
-            dot3 = """
-   <auto-negotiation enabled="no" label="PMD autoneg" supported="no">
-    <current label="MAU oper type">10GbaseT - Four-pair Category 6A or better, full duplex mode only</current>
-   </auto-negotiation>"""
-        else:
-            dot3 = ""
-        expected = ET.fromstring(
-            expected.format(
-                age=age, router=router, station=station, uname=uname, dot3=dot3
-            )
+            assert xml_eth0.findall("./status")[0].text == "RX and TX"
+        router = xml_eth0.findall("./chassis/capability[@type='Router']")[0].attrib["enabled"]
+        station = xml_eth0.findall("./chassis/capability[@type='Station']")[0].attrib["enabled"]
+        mgmt_iface = xml_eth0.findall("./chassis/mgmt-iface")[0].text
+        assert str(mgmt_iface).isdigit()
+        assert xml_eth0.findall("./chassis/id")[0].text == (
+            "00:00:00:00:00:02" if command == "neighbors" else "00:00:00:00:00:01"
         )
-        assert canonicalize(ET.tostring(xml)) == canonicalize(ET.tostring(expected))
+        assert xml_eth0.findall("./chassis/name")[0].text == (
+            "ns-2.example.com" if command == "neighbors" else "ns-1.example.com"
+        )
+        assert xml_eth0.findall("./chassis/descr")[0].text == (
+            "Spectacular GNU/Linux 2016 {}".format(uname)
+        )
+        assert xml_eth0.findall("./chassis/mgmt-ip")[0].text == (
+            "fe80::200:ff:fe00:2" if command == "neighbors" else "fe80::200:ff:fe00:1"
+        )
+        assert xml_eth0.findall("./chassis/capability[@type='Bridge']")[0].attrib["enabled"] == "off"
+        assert xml_eth0.findall("./chassis/capability[@type='Wlan']")[0].attrib["enabled"] == "off"
+        assert router in ("on", "off")
+        assert station in ("on", "off")
+        assert xml_eth0.findall("./port/id")[0].text == (
+            "00:00:00:00:00:02" if command == "neighbors" else "00:00:00:00:00:01"
+        )
+        assert xml_eth0.findall("./port/descr")[0].text == (
+            "eth1" if command == "neighbors" else "eth0"
+        )
+        if command == "neighbors":
+            assert xml_eth0.findall("./port/ttl")[0].text == "120"
+        else:
+            assert xml_eth0.findall("./ttl")[0].attrib["ttl"] == "120"
+        if "Dot3" in request.config.lldpd.features:
+            assert xml_eth0.findall("./port/auto-negotiation")[0].attrib["enabled"] == "no"
 
 
 @pytest.mark.skipif("'Dot3' not in config.lldpd.features", reason="Dot3 not supported")

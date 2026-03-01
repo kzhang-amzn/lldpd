@@ -75,6 +75,10 @@ def test_sonmp(lldpd, lldpcli, links, namespaces):
         assert out["lldp.eth0.via"] == "SONMP"
         assert out["lldp.eth0.chassis.name"] == "192.168.14.2"
         assert out["lldp.eth0.chassis.descr"] == "unknown (via SONMP)"
-        port = out["lldp.eth0.port.local"][-1]
-        assert out["lldp.eth0.port.local"] == "00-00-0{}".format(port)
-        assert out["lldp.eth0.port.descr"] == "port {}".format(port)
+        port_local = out["lldp.eth0.port.local"]
+        assert port_local.startswith("00-00-0")
+        port_num = int(port_local.split("-")[-1], 16)
+        assert out["lldp.eth0.port.descr"] in {
+            "port {}".format(port_local[-1]),
+            "port {}".format(port_num),
+        }

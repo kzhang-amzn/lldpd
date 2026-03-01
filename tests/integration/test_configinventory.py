@@ -26,8 +26,8 @@ class TestConfigInventory(object):
 
         def test_default_inventory(namespaces, lldpcli):
             with namespaces(1):
+                out = lldpcli("-f", "keyvalue", "show", "neighbors", "details")
                 if os.path.isdir("/sys/class/dmi/id"):
-                    out = lldpcli("-f", "keyvalue", "show", "neighbors", "details")
                     assert out["lldp.eth0.chassis.name"] == "ns-2.example.com"
                     assert out["lldp.eth0.lldp-med.inventory.hardware"] == "1.14"
                     assert out["lldp.eth0.lldp-med.inventory.firmware"] == "1.10"
