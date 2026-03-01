@@ -1,6 +1,47 @@
 import pytest
 import pyroute2
 import time
+from pyroute2.netlink.exceptions import NetlinkError
+
+
+def _create_ipip_tunnel(name):
+    with pyroute2.IPRoute() as ipr:
+        lo = ipr.link_lookup(ifname="lo")[0]
+        try:
+            ipr.addr("add", index=lo, address="192.0.2.1", prefixlen=32)
+        except NetlinkError:
+            # Address may already exist.
+            pass
+        try:
+            ipr.link(
+                "add",
+                ifname=name,
+                kind="ipip",
+                ipip_local="192.0.2.1",
+                ipip_remote="192.0.2.2",
+            )
+        except NetlinkError as e:
+            # Kernel may not support ipip in this environment.
+            if e.code in (2, 95):
+                pytest.skip("ipip tunnel is not supported in this environment")
+            raise
+        return ipr.link_lookup(ifname=name)[0]
+
+
+def _delete_link(name):
+    with pyroute2.IPRoute() as ipr:
+        idx = ipr.link_lookup(ifname=name)
+        if idx:
+            ipr.link("del", index=idx[0])
+
+
+def _lldpd_logs(tmpdir):
+    outdir = tmpdir.join("lldpd-outputs")
+    chunks = []
+    for entry in outdir.listdir():
+        if entry.check(file=1):
+            chunks.append(entry.read())
+    return "\n".join(chunks)
 
 
 def test_simple_bridge(lldpd1, lldpd, lldpcli, namespaces, links):
@@ -35,6 +76,42 @@ def test_remove_bridge(lldpd, lldpcli, namespaces, links):
         # Check if we still have eth0
         out = lldpcli("-f", "keyvalue", "show", "neighbors", "details")
         assert out["lldp.eth0.port.descr"] == "eth1"
+
+
+def test_ignore_ipip_tunnel_in_initial_netlink_dump(lldpd, namespaces, links, tmpdir):
+    links(namespaces(1), namespaces(2))
+    with namespaces(1):
+        idx = _create_ipip_tunnel("ipip42")
+        try:
+            lldpd("-r", sleep=1)
+            lldpd.killall()
+            assert (
+                "skip non Ethernet interface at index {}".format(idx)
+                not in _lldpd_logs(tmpdir)
+            )
+        finally:
+            _delete_link("ipip42")
+
+
+def test_ignore_ipip_tunnel_runtime_change(lldpd1, lldpd, lldpcli, namespaces, tmpdir):
+    with namespaces(2):
+        lldpd()
+    with namespaces(1):
+        idx = _create_ipip_tunnel("ipip43")
+        try:
+            time.sleep(1)
+            out = lldpcli("-f", "keyvalue", "show", "interfaces")
+            assert "lldp.eth0.status" in out
+            assert "lldp.ipip43.status" not in out
+            _delete_link("ipip43")
+            time.sleep(1)
+            lldpd.killall()
+            assert (
+                "skip non Ethernet interface at index {}".format(idx)
+                not in _lldpd_logs(tmpdir)
+            )
+        finally:
+            _delete_link("ipip43")
 
 
 @pytest.mark.skipif("'Dot1' not in config.lldpd.features", reason="Dot1 not supported")

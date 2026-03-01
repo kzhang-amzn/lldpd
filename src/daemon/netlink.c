@@ -20,14 +20,20 @@
 #include "lldpd.h"
 
 #include <errno.h>
+#include <stddef.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <net/if_arp.h>
+#include <linux/filter.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_bridge.h>
 
 #define NETLINK_BUFFER 4096
+#ifndef ARPHRD_TUNNEL6
+#define ARPHRD_TUNNEL6 769
+#endif
 
 struct netlink_req {
 	struct nlmsghdr hdr;
@@ -45,6 +51,54 @@ struct lldpd_netlink {
 	struct interfaces_device_list *devices;
 	struct interfaces_address_list *addresses;
 };
+
+/**
+ * Attach a classic BPF filter to a netlink socket.
+ *
+ * The filter drops RTM_NEWLINK/RTM_DELLINK messages for IPIP tunnel interfaces
+ * (ARPHRD_TUNNEL and ARPHRD_TUNNEL6). This keeps those events out of the
+ * userspace parser.
+ *
+ * Netlink headers are native-endian while cBPF halfword loads are in network
+ * byte order. Use htons() so comparisons are portable across endianness.
+ */
+static int
+netlink_socket_attach_filter(int s)
+{
+	struct sock_filter filter_insns[] = {
+		/* nlmsghdr.nlmsg_type */
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS, offsetof(struct nlmsghdr, nlmsg_type)),
+		/* RTM_NEWLINK? */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(RTM_NEWLINK), 2, 0),
+		/* RTM_DELLINK? */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(RTM_DELLINK), 1, 0),
+		/* Not a link message: accept */
+		BPF_STMT(BPF_RET | BPF_K, (uint32_t)-1),
+		/* ifinfomsg.ifi_type */
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS,
+		    NLMSG_HDRLEN + offsetof(struct ifinfomsg, ifi_type)),
+		/* Drop ARPHRD_TUNNEL */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(ARPHRD_TUNNEL), 2, 0),
+		/* Drop ARPHRD_TUNNEL6 */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, htons(ARPHRD_TUNNEL6), 1, 0),
+		/* Accept everything else */
+		BPF_STMT(BPF_RET | BPF_K, (uint32_t)-1),
+		/* Drop */
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog filter = {
+		.len = sizeof(filter_insns) / sizeof(filter_insns[0]),
+		.filter = filter_insns,
+	};
+
+	if (setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &filter, sizeof(filter)) < 0) {
+		log_warn("netlink",
+		    "unable to attach BPF filter to netlink socket");
+		return -1;
+	}
+
+	return 0;
+}
 
 /**
  * Set netlink socket buffer size.
@@ -108,6 +162,11 @@ netlink_connect(struct lldpd *cfg, unsigned groups)
 		log_warn("netlink", "unable to open netlink socket for changes");
 		goto error;
 	}
+	if (netlink_socket_attach_filter(s1) == -1) {
+		log_warnx("netlink",
+		    "failed to attach BPF filter on changes netlink socket");
+		goto error;
+	}
 	if (NETLINK_SEND_BUFSIZE &&
 	    netlink_socket_set_buffer_size(s1, SO_SNDBUF, "SO_SNDBUF",
 		NETLINK_SEND_BUFSIZE) == -1) {
@@ -139,6 +198,11 @@ netlink_connect(struct lldpd *cfg, unsigned groups)
 	s2 = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (s2 == -1) {
 		log_warn("netlink", "unable to open netlink socket for queries");
+		goto error;
+	}
+	if (netlink_socket_attach_filter(s2) == -1) {
+		log_warnx("netlink",
+		    "failed to attach BPF filter on query netlink socket");
 		goto error;
 	}
 	cfg->g_netlink->nl_socket_changes = s1;
